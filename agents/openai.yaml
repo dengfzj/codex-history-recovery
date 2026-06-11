@@ -1,0 +1,7 @@
+interface:
+  display_name: "Codex History Recovery"
+  short_description: "Recover missing Codex conversations"
+  brand_color: "#2563EB"
+  default_prompt: "Use $codex-history-recovery to audit and fork my missing Codex conversation history into the current provider."
+policy:
+  allow_implicit_invocation: true
