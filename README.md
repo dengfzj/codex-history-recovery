@@ -1,5 +1,9 @@
 # Codex History Recovery User Guide
 
+[English](README.md) | [简体中文](README.zh-CN.md)
+
+This project is inherited from the [CodexPanel](https://codexpanel.com) project, which is currently under development.
+
 This skill audits, backs up, migrates, and restores local Codex Desktop conversation history.
 
 It protects original history first: audit and back up, then create new conversations through Codex app-server `thread/fork`. By default, it does not manually edit thread rows in SQLite and does not delete original `sessions/` or `archived_sessions/` files.

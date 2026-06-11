@@ -1,5 +1,9 @@
 # Codex History Recovery 使用指南
 
+[English](README.md) | [简体中文](README.zh-CN.md)
+
+本项目继承自正在开发中的 [CodexPanel](https://codexpanel.com) 项目。
+
 这个 skill 用来审计、备份、迁移和恢复 Codex 桌面端的本地会话历史。
 
 它优先保护原始历史：先审计和备份，再通过 Codex app-server 的 `thread/fork` 生成新会话。默认不直接改 SQLite 线程记录，不删除原始 `sessions/` 或 `archived_sessions/`。
