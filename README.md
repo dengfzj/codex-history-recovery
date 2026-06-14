@@ -6,6 +6,18 @@ This project is inherited from the [CodexPanel](https://codexpanel.com) project,
 
 This skill audits, backs up, migrates, and restores local Codex Desktop conversation history.
 
+## Path Placeholders
+
+Examples use placeholders instead of machine-specific paths:
+
+- `<SKILL_DIR>`: this skill's installed directory, discovered at runtime.
+- `<CODEX_HOME>`: the Codex home being repaired, discovered from `--codex-home`, `CODEX_HOME`, `codex doctor --json`, or the platform's standard Codex home.
+- `<OLD_CODEX_HOME>`: an old Codex home from another install, account, or machine.
+- `<BACKUP_ROOT>`: a user-chosen backup/output directory.
+- `<EVIDENCE_ROOT>`: an optional backup/evidence directory that may contain `fork-results.json`, `thread-candidates.json`, `session_index.jsonl`, or `state_5.sqlite`.
+
+Do not copy these placeholders literally. Do not assume a custom drive or backup directory exists; confirm paths with the user or discover them from the runtime environment.
+
 It protects original history first: audit and back up, then create new conversations through Codex app-server `thread/fork`. By default, it does not manually edit thread rows in SQLite and does not delete original `sessions/` or `archived_sessions/` files.
 
 ## When To Use It
@@ -14,29 +26,30 @@ It protects original history first: audit and back up, then create new conversat
 - Old conversations still exist on disk but are not visible under the current provider.
 - You want to fork old `codex`, `openai`, or `openai_http` threads into the current `OpenAI` provider.
 - You want archived conversations restored into archived space.
-- You want to migrate history from an old `%USERPROFILE%\.codex` directory or another computer into the current `D:\CodexHome`.
+- You want to migrate history from an old `<OLD_CODEX_HOME>` directory or another computer into the current `<CODEX_HOME>`.
 - You only want a read-only backup package for safekeeping.
 
 ## Confirm Before Writing
 
 Before running commands that change state, decide:
 
-1. Which `CODEX_HOME` to recover, for example `D:\CodexHome` or `C:\Users\you\.codex`.
+1. Which `CODEX_HOME` to recover, for example `<CODEX_HOME>` or `<OLD_CODEX_HOME>`.
 2. Where backups should be written.
 3. Target provider/model, for example `OpenAI` / `gpt-5.5`.
 4. Whether archived conversations are included.
 5. Whether subagent/internal threads are included.
 6. Whether new forks preserve source archive state. Recommended: `preserve-source`.
 7. Whether to restore everything or filter by provider, project path, or keyword.
+8. Whether there are other backup/evidence locations to search, such as old backup roots, migration packages, prior `session_index.jsonl`, prior `state_5.sqlite`, or previous `fork-results.json` files.
 
 ## Safest Local Recovery Flow
 
 ### 1. Audit and back up
 
 ```powershell
-python D:\CodexHome\skills\codex-history-recovery\scripts\codex_history_inventory.py audit `
-  --codex-home D:\CodexHome `
-  --backup-root F:\codex-backups `
+python <SKILL_DIR>\scripts\codex_history_inventory.py audit `
+  --codex-home <CODEX_HOME> `
+  --backup-root <BACKUP_ROOT> `
   --full-backup `
   --archived all `
   --source-providers codex,openai,openai_http `
@@ -55,8 +68,8 @@ The output directory uses a unique timestamp and contains:
 ### 2. Dry-run fork
 
 ```powershell
-node D:\CodexHome\skills\codex-history-recovery\scripts\fork_threads.mjs `
-  --candidates F:\codex-backups\codex-history-recovery-YYYYMMDD-HHMMSS-ffffff\thread-candidates.json `
+node <SKILL_DIR>\scripts\fork_threads.mjs `
+  --candidates <BACKUP_ROOT>\codex-history-recovery-YYYYMMDD-HHMMSS-ffffff\thread-candidates.json `
   --target-provider OpenAI `
   --target-model gpt-5.5 `
   --target-archive-mode preserve-source `
@@ -68,8 +81,8 @@ Without `--execute`, no state is changed.
 ### 3. Execute fork
 
 ```powershell
-node D:\CodexHome\skills\codex-history-recovery\scripts\fork_threads.mjs `
-  --candidates F:\codex-backups\codex-history-recovery-YYYYMMDD-HHMMSS-ffffff\thread-candidates.json `
+node <SKILL_DIR>\scripts\fork_threads.mjs `
+  --candidates <BACKUP_ROOT>\codex-history-recovery-YYYYMMDD-HHMMSS-ffffff\thread-candidates.json `
   --target-provider OpenAI `
   --target-model gpt-5.5 `
   --target-archive-mode preserve-source `
@@ -88,10 +101,10 @@ Archive modes:
 Sometimes rollout files exist before the state DB indexes them. This command paginates through `thread/list` and asks Codex to scan rollout files:
 
 ```powershell
-node D:\CodexHome\skills\codex-history-recovery\scripts\scan_threads.mjs `
+node <SKILL_DIR>\scripts\scan_threads.mjs `
   --ws-url ws://127.0.0.1:4888 `
   --model-providers OpenAI `
-  --output F:\codex-backups\thread-list-scan.json
+  --output <BACKUP_ROOT>\thread-list-scan.json
 ```
 
 Omit `--model-providers OpenAI` to inspect all providers.
@@ -99,9 +112,9 @@ Omit `--model-providers OpenAI` to inspect all providers.
 ### 5. Validate mapping
 
 ```powershell
-python D:\CodexHome\skills\codex-history-recovery\scripts\codex_history_inventory.py validate `
-  --codex-home D:\CodexHome `
-  --mapping F:\codex-backups\codex-history-recovery-YYYYMMDD-HHMMSS-ffffff\fork-results.json `
+python <SKILL_DIR>\scripts\codex_history_inventory.py validate `
+  --codex-home <CODEX_HOME> `
+  --mapping <BACKUP_ROOT>\codex-history-recovery-YYYYMMDD-HHMMSS-ffffff\fork-results.json `
   --target-provider OpenAI `
   --target-model gpt-5.5
 ```
@@ -114,7 +127,28 @@ Validation checks:
 - Fork model is correct.
 - Active/archived state matches the requested mode.
 
-### 6. Run doctor
+### 6. Repair persistent titles if needed
+
+If restored threads still appear as `New conversation`, or their sidebar names fall back to a first-message preview after restarting Codex, repair the persistent title index from fork mappings and backup evidence:
+
+```powershell
+python <SKILL_DIR>\scripts\codex_history_inventory.py repair-titles `
+  --codex-home <CODEX_HOME> `
+  --backup-root <BACKUP_ROOT> `
+  --evidence-root <EVIDENCE_ROOT> `
+  --target-providers OpenAI `
+  --confidence strong
+```
+
+Without `--execute`, this is a dry-run and writes only a plan under `<BACKUP_ROOT>`. Use `--execute` only after reviewing the plan. Evidence confidence:
+
+- `strong`: use explicit fork mappings, candidate files, and session indexes. Recommended first.
+- `medium`: also use titles found in backed-up `state_5.sqlite` files.
+- `all`: include current DB fallback evidence; use only when you mainly need missing sidebar index entries filled.
+
+The command never assumes a backup drive. Pass every known backup/evidence directory with repeated `--evidence-root` flags.
+
+### 7. Run doctor
 
 ```powershell
 codex doctor --json
@@ -128,13 +162,13 @@ state.rollout_db_parity.status = ok
 
 An unrelated warning under `updates.status` does not usually mean recovery failed.
 
-### 7. Write a recovery report
+### 8. Write a recovery report
 
 ```powershell
-python D:\CodexHome\skills\codex-history-recovery\scripts\codex_history_inventory.py report `
-  --codex-home D:\CodexHome `
-  --mapping F:\codex-backups\codex-history-recovery-YYYYMMDD-HHMMSS-ffffff\fork-results.json `
-  --output F:\codex-backups\restore-report.md `
+python <SKILL_DIR>\scripts\codex_history_inventory.py report `
+  --codex-home <CODEX_HOME> `
+  --mapping <BACKUP_ROOT>\codex-history-recovery-YYYYMMDD-HHMMSS-ffffff\fork-results.json `
+  --output <BACKUP_ROOT>\restore-report.md `
   --doctor
 ```
 
@@ -145,9 +179,9 @@ The report includes provider counts, fork totals, and doctor rollout parity stat
 ### Source machine: audit
 
 ```powershell
-python D:\CodexHome\skills\codex-history-recovery\scripts\codex_history_inventory.py audit `
-  --codex-home C:\Users\you\.codex `
-  --backup-root F:\codex-backups `
+python <SKILL_DIR>\scripts\codex_history_inventory.py audit `
+  --codex-home <OLD_CODEX_HOME> `
+  --backup-root <BACKUP_ROOT> `
   --full-backup `
   --archived all
 ```
@@ -155,10 +189,10 @@ python D:\CodexHome\skills\codex-history-recovery\scripts\codex_history_inventor
 ### Source machine: export package
 
 ```powershell
-python D:\CodexHome\skills\codex-history-recovery\scripts\codex_history_inventory.py export-package `
-  --codex-home C:\Users\you\.codex `
-  --candidates F:\codex-backups\codex-history-recovery-YYYYMMDD-HHMMSS-ffffff\thread-candidates.json `
-  --output F:\codex-backups\old-dotcodex-migration.zip `
+python <SKILL_DIR>\scripts\codex_history_inventory.py export-package `
+  --codex-home <OLD_CODEX_HOME> `
+  --candidates <BACKUP_ROOT>\codex-history-recovery-YYYYMMDD-HHMMSS-ffffff\thread-candidates.json `
+  --output <BACKUP_ROOT>\old-dotcodex-migration.zip `
   --name "old dotcodex migration"
 ```
 
@@ -167,10 +201,10 @@ The migration zip never includes `auth.json` or API keys.
 ### Destination machine: dry-run import
 
 ```powershell
-python D:\CodexHome\skills\codex-history-recovery\scripts\codex_history_inventory.py import-package `
-  --codex-home D:\CodexHome `
-  --package F:\codex-backups\old-dotcodex-migration.zip `
-  --backup-root F:\codex-backups
+python <SKILL_DIR>\scripts\codex_history_inventory.py import-package `
+  --codex-home <CODEX_HOME> `
+  --package <BACKUP_ROOT>\old-dotcodex-migration.zip `
+  --backup-root <BACKUP_ROOT>
 ```
 
 The dry-run reports:
@@ -182,10 +216,10 @@ The dry-run reports:
 ### Destination machine: execute import
 
 ```powershell
-python D:\CodexHome\skills\codex-history-recovery\scripts\codex_history_inventory.py import-package `
-  --codex-home D:\CodexHome `
-  --package F:\codex-backups\old-dotcodex-migration.zip `
-  --backup-root F:\codex-backups `
+python <SKILL_DIR>\scripts\codex_history_inventory.py import-package `
+  --codex-home <CODEX_HOME> `
+  --package <BACKUP_ROOT>\old-dotcodex-migration.zip `
+  --backup-root <BACKUP_ROOT> `
   --execute
 ```
 
@@ -205,17 +239,17 @@ the same thread ID probably exists in both `sessions/` and `archived_sessions/`,
 Dry-run:
 
 ```powershell
-python D:\CodexHome\skills\codex-history-recovery\scripts\codex_history_inventory.py quarantine-duplicates `
-  --codex-home D:\CodexHome `
-  --backup-root F:\codex-backups
+python <SKILL_DIR>\scripts\codex_history_inventory.py quarantine-duplicates `
+  --codex-home <CODEX_HOME> `
+  --backup-root <BACKUP_ROOT>
 ```
 
 Execute:
 
 ```powershell
-python D:\CodexHome\skills\codex-history-recovery\scripts\codex_history_inventory.py quarantine-duplicates `
-  --codex-home D:\CodexHome `
-  --backup-root F:\codex-backups `
+python <SKILL_DIR>\scripts\codex_history_inventory.py quarantine-duplicates `
+  --codex-home <CODEX_HOME> `
+  --backup-root <BACKUP_ROOT> `
   --execute
 ```
 
@@ -237,7 +271,7 @@ That is expected. Recovery preserves original history and creates new `OpenAI` f
 
 ### Why do some restored titles still look generic?
 
-The fork script sets titles from source by default. If the UI still shows a generic title, restart Codex or open the thread so the UI refreshes.
+The fork script sets titles from the source by default and re-applies them after archive/unarchive operations. If titles still reset after restarting Codex, run `repair-titles` with explicit `--evidence-root` paths so the script can rebuild `session_index.jsonl` and persistent `threads.title` from mappings and backups.
 
 ### Can I copy `state_5.sqlite` from one computer to another?
 
@@ -246,7 +280,7 @@ Not recommended. It can overwrite destination history, account state, and indexe
 ## File Reference
 
 - `SKILL.md`: workflow used by Codex agents.
-- `scripts/codex_history_inventory.py`: audit, backup, export, import, validate, quarantine, and report commands.
+- `scripts/codex_history_inventory.py`: audit, backup, export, import, validate, title repair, quarantine, and report commands.
 - `scripts/fork_threads.mjs`: forks threads through Codex app-server.
 - `scripts/scan_threads.mjs`: paginates `thread/list`, triggers rollout scanning, and outputs visible inventory counts.
 - `README.zh-CN.md`: Chinese user guide.

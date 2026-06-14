@@ -20,20 +20,22 @@ Before changing state, ask short questions and wait for answers. Do not guess si
 Ask at least:
 
 1. **Goal**: restore missing sidebar on this machine, migrate A machine to B machine, export a read-only backup, or fork archived history too?
-2. **Codex home**: which `CODEX_HOME` should be used? Offer detected paths such as `D:\CodexHome` or `%USERPROFILE%\.codex`.
-3. **Backup path**: where should timestamped backups/packages be written?
+2. **Codex home**: which `CODEX_HOME` should be used? Offer detected paths such as `<CODEX_HOME>` or `<OLD_CODEX_HOME>`.
+3. **Backup path**: where should timestamped backups/packages be written? Do not assume a drive or custom backup root.
 4. **Target provider/model**: current provider/model, or a specific provider such as `OpenAI` and model such as `gpt-5.5`?
 5. **Active/archived behavior**: preserve source archive state, make all forks active, or put all forks into archived space?
 6. **Scope**: all user-main threads, only specific providers, only archived, only active, or search keywords?
-7. **Execution**: audit/dry-run first, then explicit permission before `--execute`.
+7. **Evidence roots**: ask whether there are other backup records to search, including old backup roots, migration zips, prior `session_index.jsonl`, prior `state_5.sqlite`, `thread-candidates.json`, or `fork-results.json`.
+8. **Execution**: audit/dry-run first, then explicit permission before `--execute`.
 
-For high-risk cases, add one more confirmation: whether to include full rollout folders in backup and whether to package data for another machine.
+For high-risk cases, add one more confirmation: whether to include full rollout folders in backup and whether to package data for another machine. Never bake a user's custom Codex home, skill installation directory, or backup root into docs, defaults, or generated commands.
 
 ## Standard Workflow
 
 1. **Identify state location**
    - Prefer an explicit `--codex-home`.
-   - Otherwise inspect `$CODEX_HOME`, `codex doctor --json`, `%USERPROFILE%\.codex`, and known custom locations such as `D:\CodexHome`.
+   - Otherwise inspect `$CODEX_HOME`, `codex doctor --json`, and the platform's standard Codex home such as `~/.codex`.
+   - Do not assume any user-specific custom directory. If a custom install is suspected, ask the user or discover it from runtime diagnostics.
    - Confirm `state_5.sqlite` exists.
 
 2. **Diagnose provider filtering**
@@ -56,7 +58,7 @@ For high-risk cases, add one more confirmation: whether to include full rollout 
    - If restoring archived history into archived space, temporarily unarchive the source, fork it, rearchive the source, then archive the new fork.
    - If restoring active history, fork and leave the new thread active.
    - Save source-to-fork mapping.
-   - By default, set each fork title from the source title to reduce the "New conversation" display until first open. If titles still appear lazy, opening the thread lets Codex infer the title from history.
+   - By default, set each fork title from the source title, then re-apply it after archive/unarchive operations settle. If titles still reset after restart, use `repair-titles` with explicit evidence roots.
 
 6. **Validate**
    - Trigger an app-server scan with `scan_threads.mjs`; it calls `thread/list` with `useStateDbOnly=false` and paginates active/archived results.
@@ -77,7 +79,7 @@ Use the scripts from this skill folder rather than rewriting long one-off comman
 For non-expert users, start here:
 
 ```powershell
-python D:\CodexHome\skills\codex-history-recovery\scripts\codex_history_inventory.py wizard
+python <SKILL_DIR>\scripts\codex_history_inventory.py wizard
 ```
 
 Wizard modes:
@@ -89,9 +91,9 @@ Wizard modes:
 ### Audit and candidate generation
 
 ```powershell
-python D:\CodexHome\skills\codex-history-recovery\scripts\codex_history_inventory.py audit `
-  --codex-home D:\CodexHome `
-  --backup-root F:\codex-backups `
+python <SKILL_DIR>\scripts\codex_history_inventory.py audit `
+  --codex-home <CODEX_HOME> `
+  --backup-root <BACKUP_ROOT> `
   --full-backup `
   --archived all
 ```
@@ -116,8 +118,8 @@ Useful filters:
 Default is dry-run; pass `--execute` to change state.
 
 ```powershell
-node D:\CodexHome\skills\codex-history-recovery\scripts\fork_threads.mjs `
-  --candidates F:\codex-backups\restore-YYYYMMDD-HHMMSS\thread-candidates.json `
+node <SKILL_DIR>\scripts\fork_threads.mjs `
+  --candidates <BACKUP_ROOT>\restore-YYYYMMDD-HHMMSS\thread-candidates.json `
   --target-provider OpenAI `
   --target-model gpt-5.5 `
   --target-archive-mode preserve-source `
@@ -134,12 +136,47 @@ If app-server rejects `excludeTurns`, the script retries without that experiment
 
 By default the fork script runs `thread/name/set` using the source title. Disable with `--no-set-title-from-source` if the user wants Codex to infer titles lazily.
 
+The fork script re-applies the copied title after final archive/unarchive state settles. This avoids builds where a sidebar metadata refresh overwrites the first name write.
+
+### Repair persistent sidebar titles
+
+Use this when restored forks reopen as `New conversation` or the sidebar title falls back to a first-message preview after restarting Codex. It repairs persistent title storage from explicit evidence; it does not assume any backup path.
+
+Dry-run first:
+
+```powershell
+python <SKILL_DIR>\scripts\codex_history_inventory.py repair-titles `
+  --codex-home <CODEX_HOME> `
+  --backup-root <BACKUP_ROOT> `
+  --evidence-root <EVIDENCE_ROOT> `
+  --target-providers OpenAI `
+  --confidence strong
+```
+
+Then, only after the user reviews the plan:
+
+```powershell
+python <SKILL_DIR>\scripts\codex_history_inventory.py repair-titles `
+  --codex-home <CODEX_HOME> `
+  --backup-root <BACKUP_ROOT> `
+  --evidence-root <EVIDENCE_ROOT> `
+  --target-providers OpenAI `
+  --confidence strong `
+  --execute
+```
+
+Ask the user whether more evidence roots exist before running this command. Useful evidence includes `fork-results.json`, `thread-candidates.json`, old `session_index.jsonl`, and old `state_5.sqlite` files. Confidence modes:
+
+- `strong`: explicit mappings/candidates/session indexes. Prefer this first.
+- `medium`: also use backed-up state DB titles.
+- `all`: include current DB fallback evidence; use only when the user accepts lower confidence.
+
 ### Validate mapping
 
 ```powershell
-python D:\CodexHome\skills\codex-history-recovery\scripts\codex_history_inventory.py validate `
-  --codex-home D:\CodexHome `
-  --mapping F:\codex-backups\restore-YYYYMMDD-HHMMSS\fork-results.json `
+python <SKILL_DIR>\scripts\codex_history_inventory.py validate `
+  --codex-home <CODEX_HOME> `
+  --mapping <BACKUP_ROOT>\restore-YYYYMMDD-HHMMSS\fork-results.json `
   --target-provider OpenAI `
   --target-model gpt-5.5
 ```
@@ -149,10 +186,10 @@ python D:\CodexHome\skills\codex-history-recovery\scripts\codex_history_inventor
 Use this after importing rollout files, after forking, or whenever `state.rollout_db_parity` looks stale. It is read-only, but `useStateDbOnly=false` asks Codex to scan rollout JSONL files and repair thread metadata.
 
 ```powershell
-node D:\CodexHome\skills\codex-history-recovery\scripts\scan_threads.mjs `
+node <SKILL_DIR>\scripts\scan_threads.mjs `
   --ws-url ws://127.0.0.1:4888 `
   --model-providers OpenAI `
-  --output F:\codex-backups\thread-list-scan.json
+  --output <BACKUP_ROOT>\thread-list-scan.json
 ```
 
 Omit `--model-providers` to inspect all providers.
@@ -162,9 +199,9 @@ Omit `--model-providers` to inspect all providers.
 Use this when doctor reports duplicate rollout thread IDs, commonly after importing a thread that already exists in active or archived space.
 
 ```powershell
-python D:\CodexHome\skills\codex-history-recovery\scripts\codex_history_inventory.py quarantine-duplicates `
-  --codex-home D:\CodexHome `
-  --backup-root F:\codex-backups
+python <SKILL_DIR>\scripts\codex_history_inventory.py quarantine-duplicates `
+  --codex-home <CODEX_HOME> `
+  --backup-root <BACKUP_ROOT>
 ```
 
 The default is dry-run. If the plan is correct, rerun with `--execute`. The command moves duplicate files into a timestamped quarantine directory and keeps the first archived/original-looking file in place.
@@ -172,10 +209,10 @@ The default is dry-run. If the plan is correct, rerun with `--execute`. The comm
 ### Final report
 
 ```powershell
-python D:\CodexHome\skills\codex-history-recovery\scripts\codex_history_inventory.py report `
-  --codex-home D:\CodexHome `
-  --mapping F:\codex-backups\restore-YYYYMMDD-HHMMSS\fork-results.json `
-  --output F:\codex-backups\restore-report.md `
+python <SKILL_DIR>\scripts\codex_history_inventory.py report `
+  --codex-home <CODEX_HOME> `
+  --mapping <BACKUP_ROOT>\restore-YYYYMMDD-HHMMSS\fork-results.json `
+  --output <BACKUP_ROOT>\restore-report.md `
   --doctor
 ```
 
@@ -188,9 +225,9 @@ Principle: do not overwrite B's database with A's database. Export A's rollout a
 ### A machine: audit and export
 
 ```powershell
-python D:\CodexHome\skills\codex-history-recovery\scripts\codex_history_inventory.py audit `
-  --codex-home D:\CodexHome `
-  --backup-root F:\codex-backups `
+python <SKILL_DIR>\scripts\codex_history_inventory.py audit `
+  --codex-home <CODEX_HOME> `
+  --backup-root <BACKUP_ROOT> `
   --full-backup `
   --archived all
 ```
@@ -198,10 +235,10 @@ python D:\CodexHome\skills\codex-history-recovery\scripts\codex_history_inventor
 Then package the selected candidates:
 
 ```powershell
-python D:\CodexHome\skills\codex-history-recovery\scripts\codex_history_inventory.py export-package `
-  --codex-home D:\CodexHome `
-  --candidates F:\codex-backups\codex-history-recovery-YYYYMMDD-HHMMSS\thread-candidates.json `
-  --output F:\codex-backups\codex-history-migration.zip `
+python <SKILL_DIR>\scripts\codex_history_inventory.py export-package `
+  --codex-home <CODEX_HOME> `
+  --candidates <BACKUP_ROOT>\codex-history-recovery-YYYYMMDD-HHMMSS\thread-candidates.json `
+  --output <BACKUP_ROOT>\codex-history-migration.zip `
   --name "A-to-B history migration"
 ```
 
@@ -212,19 +249,19 @@ The export package intentionally excludes `auth.json` and API keys.
 Copy the zip to B, install this skill, then run:
 
 ```powershell
-python D:\CodexHome\skills\codex-history-recovery\scripts\codex_history_inventory.py import-package `
-  --codex-home D:\CodexHome `
-  --package D:\incoming\codex-history-migration.zip `
-  --backup-root F:\codex-backups
+python <SKILL_DIR>\scripts\codex_history_inventory.py import-package `
+  --codex-home <CODEX_HOME> `
+  --package <PACKAGE_PATH>\codex-history-migration.zip `
+  --backup-root <BACKUP_ROOT>
 ```
 
 If the plan looks right:
 
 ```powershell
-python D:\CodexHome\skills\codex-history-recovery\scripts\codex_history_inventory.py import-package `
-  --codex-home D:\CodexHome `
-  --package D:\incoming\codex-history-migration.zip `
-  --backup-root F:\codex-backups `
+python <SKILL_DIR>\scripts\codex_history_inventory.py import-package `
+  --codex-home <CODEX_HOME> `
+  --package <PACKAGE_PATH>\codex-history-migration.zip `
+  --backup-root <BACKUP_ROOT> `
   --execute
 ```
 
@@ -251,6 +288,7 @@ After import:
 - Never run destructive git or filesystem commands during recovery.
 - Never expose or print full API keys from `auth.json`.
 - Never include `auth.json` in a multi-device migration package.
+- Never publish or hardcode user-specific paths, drive letters, home directories, backup roots, or skill installation paths; use placeholders and runtime discovery.
 - Prefer app-server methods over manual SQLite writes.
 - If the app-server is unavailable, repair by `thread/list` scans first; raw DB surgery is last resort and needs explicit user approval.
 - After any interrupted run, validate source archive state before retrying.

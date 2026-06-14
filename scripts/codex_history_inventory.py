@@ -17,14 +17,15 @@ import subprocess
 import sys
 import zipfile
 from collections import Counter
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 
 STATE_DB = "state_5.sqlite"
+SESSION_INDEX = "session_index.jsonl"
 COPY_FILES = [
-    "session_index.jsonl",
+    SESSION_INDEX,
     "auth.json",
     "config.toml",
     ".codex-global-state.json",
@@ -40,6 +41,20 @@ ROLLOUT_DIRS = [
     "sessions",
     "archived_sessions",
 ]
+UUID_RE = re.compile(
+    r"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})",
+    flags=re.IGNORECASE,
+)
+PLACEHOLDER_TITLES = {
+    "",
+    "new conversation",
+    "new chat",
+    "untitled",
+    "untitled conversation",
+    "新对话",
+    "新会话",
+    "未命名",
+}
 
 
 def eprint(*parts: object) -> None:
@@ -94,6 +109,58 @@ def public_thread_sample(row: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def doctor_codex_home_candidates() -> list[Path]:
+    """Best-effort CODEX_HOME discovery from `codex doctor --json` output.
+
+    The doctor JSON shape may change across Codex versions, so this function
+    recursively inspects string values and accepts either a directory containing
+    state_5.sqlite or a direct path to state_5.sqlite. It never assumes a
+    user-specific custom path.
+    """
+    try:
+        proc = subprocess.run(
+            ["codex", "doctor", "--json"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except Exception:
+        return []
+    if proc.returncode != 0 or not proc.stdout.strip():
+        return []
+    try:
+        data = json.loads(proc.stdout)
+    except json.JSONDecodeError:
+        return []
+
+    found: list[Path] = []
+
+    def consider(value: str) -> None:
+        expanded = expand_path(value)
+        if not expanded:
+            return
+        candidates = []
+        if expanded.name == STATE_DB:
+            candidates.append(expanded.parent)
+        candidates.append(expanded)
+        for candidate in candidates:
+            if (candidate / STATE_DB).exists():
+                found.append(candidate)
+
+    def walk(value: Any) -> None:
+        if isinstance(value, dict):
+            for item in value.values():
+                walk(item)
+        elif isinstance(value, list):
+            for item in value:
+                walk(item)
+        elif isinstance(value, str):
+            consider(value)
+
+    walk(data)
+    return found
+
+
 def discover_codex_home(explicit: str | None) -> Path:
     candidates: list[Path] = []
     explicit_path = expand_path(explicit)
@@ -102,13 +169,11 @@ def discover_codex_home(explicit: str | None) -> Path:
     env_home = expand_path(os.environ.get("CODEX_HOME"))
     if env_home:
         candidates.append(env_home)
-    for raw in [
-        r"D:\CodexHome",
-        str(Path.home() / ".codex"),
-    ]:
-        p = expand_path(raw)
-        if p:
-            candidates.append(p)
+    candidates.extend(doctor_codex_home_candidates())
+
+    standard_home = expand_path(str(Path.home() / ".codex"))
+    if standard_home:
+        candidates.append(standard_home)
 
     seen: set[Path] = set()
     for candidate in candidates:
@@ -646,9 +711,555 @@ def load_mapping(path: Path) -> list[dict[str, Any]]:
     data = json.loads(path.read_text(encoding="utf-8"))
     if isinstance(data, dict) and "results" in data:
         data = data["results"]
+    elif isinstance(data, dict) and any(key in data for key in ["succeeded", "failed", "skipped"]):
+        rows = []
+        for key in ["succeeded", "failed", "skipped"]:
+            values = data.get(key)
+            if isinstance(values, list):
+                rows.extend(item for item in values if isinstance(item, dict))
+        data = rows
     if not isinstance(data, list):
         raise SystemExit("Mapping must be a list or an object with results[].")
     return [item for item in data if isinstance(item, dict)]
+
+
+def normalize_title(value: object, max_length: int = 160) -> str:
+    title = re.sub(r"\s+", " ", str(value or "")).strip()
+    if not title:
+        return ""
+    if max_length > 0 and len(title) > max_length:
+        return title[: max(0, max_length - 1)] + "…"
+    return title
+
+
+def is_placeholder_title(value: object) -> bool:
+    return normalize_title(value, 0).lower() in PLACEHOLDER_TITLES
+
+
+def iso_now_z() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="microseconds").replace("+00:00", "Z")
+
+
+def epoch_to_iso_z(value: object) -> str:
+    try:
+        raw = int(value)
+    except (TypeError, ValueError):
+        return iso_now_z()
+    if raw > 10_000_000_000:
+        seconds = raw / 1000
+    else:
+        seconds = raw
+    try:
+        return datetime.fromtimestamp(seconds, timezone.utc).isoformat(timespec="microseconds").replace("+00:00", "Z")
+    except (OSError, OverflowError, ValueError):
+        return iso_now_z()
+
+
+def read_session_index(path: Path) -> list[dict[str, Any]]:
+    if not path.exists():
+        return []
+    entries: list[dict[str, Any]] = []
+    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        if not line.strip():
+            continue
+        try:
+            item = json.loads(line)
+        except json.JSONDecodeError:
+            entries.append({"_raw": line})
+            continue
+        if isinstance(item, dict):
+            entries.append(item)
+    return entries
+
+
+def write_session_index(path: Path, entries: list[dict[str, Any]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lines = []
+    for item in entries:
+        if "_raw" in item:
+            lines.append(str(item["_raw"]))
+        else:
+            lines.append(json.dumps(item, ensure_ascii=False, separators=(",", ":")))
+    path.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
+
+
+def read_session_index_titles(path: Path) -> dict[str, list[dict[str, Any]]]:
+    titles: dict[str, list[dict[str, Any]]] = {}
+    for item in read_session_index(path):
+        thread_id = item.get("id")
+        title = normalize_title(item.get("thread_name"), 0)
+        if thread_id and title:
+            titles.setdefault(str(thread_id), []).append({
+                "title": title,
+                "kind": "session_index",
+                "path": str(path),
+            })
+    return titles
+
+
+def read_db_titles(path: Path, kind: str = "state_db") -> dict[str, list[dict[str, Any]]]:
+    titles: dict[str, list[dict[str, Any]]] = {}
+    try:
+        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+        conn.row_factory = sqlite3.Row
+        has_threads = conn.execute(
+            "select name from sqlite_master where type='table' and name='threads'"
+        ).fetchone()
+        if not has_threads:
+            return titles
+        cols = {row["name"] for row in conn.execute("pragma table_info(threads)")}
+        if "id" not in cols or "title" not in cols:
+            return titles
+        for row in conn.execute("select id, coalesce(title, '') as title from threads"):
+            title = normalize_title(row["title"], 0)
+            if row["id"] and title:
+                titles.setdefault(str(row["id"]), []).append({
+                    "title": title,
+                    "kind": kind,
+                    "path": str(path),
+                })
+    except sqlite3.Error:
+        return titles
+    return titles
+
+
+def add_title_evidence(
+    target: dict[str, list[dict[str, Any]]],
+    thread_id: object,
+    title: object,
+    kind: str,
+    path: object,
+    extra: dict[str, Any] | None = None,
+) -> None:
+    tid = str(thread_id or "").strip()
+    name = normalize_title(title, 0)
+    if not tid or not name:
+        return
+    item = {"title": name, "kind": kind, "path": str(path)}
+    if extra:
+        item.update(extra)
+    target.setdefault(tid, []).append(item)
+
+
+def merge_title_evidence(
+    target: dict[str, list[dict[str, Any]]],
+    source: dict[str, list[dict[str, Any]]],
+    kind_override: str | None = None,
+) -> None:
+    for thread_id, values in source.items():
+        for item in values:
+            copied = dict(item)
+            if kind_override:
+                copied["kind"] = kind_override
+            target.setdefault(thread_id, []).append(copied)
+
+
+def evidence_roots_from_args(raw_roots: list[str] | None) -> list[Path]:
+    roots: list[Path] = []
+    for raw in raw_roots or []:
+        p = expand_path(raw)
+        if p:
+            roots.append(p)
+    seen: set[Path] = set()
+    result = []
+    for root in roots:
+        if root not in seen and root.exists():
+            seen.add(root)
+            result.append(root)
+    return result
+
+
+def iter_evidence_files(roots: list[Path], names: set[str]) -> list[Path]:
+    files: list[Path] = []
+    seen: set[Path] = set()
+    for root in roots:
+        candidates = [root] if root.is_file() else [p for p in root.rglob("*") if p.is_file()]
+        for path in candidates:
+            if path.name in names and path not in seen:
+                seen.add(path)
+                files.append(path)
+    return sorted(files, key=lambda p: (p.name, str(p).lower()))
+
+
+def load_title_evidence(
+    codex_home: Path,
+    evidence_roots: list[Path],
+    mapping_paths: list[Path],
+    include_current_db_fallback: bool,
+) -> tuple[dict[str, list[dict[str, Any]]], dict[str, list[dict[str, str]]], dict[str, Any]]:
+    by_id: dict[str, list[dict[str, Any]]] = {}
+    source_for_fork: dict[str, list[dict[str, str]]] = {}
+
+    evidence_files = iter_evidence_files(
+        evidence_roots,
+        {
+            SESSION_INDEX,
+            STATE_DB,
+            "thread-candidates.json",
+            "fork-results.json",
+        },
+    )
+    index_files = [codex_home / SESSION_INDEX] + [p for p in evidence_files if p.name == SESSION_INDEX]
+    db_files = [p for p in evidence_files if p.name == STATE_DB]
+    if include_current_db_fallback:
+        db_files = [codex_home / STATE_DB] + db_files
+
+    for path in index_files:
+        if path.exists():
+            merge_title_evidence(by_id, read_session_index_titles(path))
+
+    for path in db_files:
+        if path.exists():
+            kind = "current_state_db" if path.resolve() == (codex_home / STATE_DB).resolve() else "state_db"
+            merge_title_evidence(by_id, read_db_titles(path, kind=kind))
+
+    candidate_files = [p for p in evidence_files if p.name == "thread-candidates.json"]
+    for path in candidate_files:
+        data = json.loads(path.read_text(encoding="utf-8", errors="replace"))
+        rows = data if isinstance(data, list) else data.get("candidates", [])
+        if not isinstance(rows, list):
+            continue
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            add_title_evidence(
+                by_id,
+                row.get("id") or row.get("threadId") or row.get("sourceThreadId"),
+                row.get("title") or row.get("sourceTitle"),
+                "thread_candidates",
+                path,
+            )
+
+    mapping_files = [p for p in evidence_files if p.name == "fork-results.json"]
+    for path in mapping_paths:
+        if path.exists() and path not in mapping_files:
+            mapping_files.append(path)
+
+    for path in mapping_files:
+        rows = load_mapping(path)
+        for row in rows:
+            source_id = row.get("sourceThreadId")
+            fork_id = row.get("forkThreadId") or row.get("targetThreadId")
+            if fork_id and source_id:
+                source_for_fork.setdefault(str(fork_id), []).append({
+                    "sourceThreadId": str(source_id),
+                    "path": str(path),
+                    "kind": "fork_results",
+                })
+            title = row.get("title") or row.get("sourceTitle")
+            if fork_id and title:
+                add_title_evidence(by_id, fork_id, title, "fork_results_direct", path)
+            if source_id and title:
+                add_title_evidence(by_id, source_id, title, "fork_results_source", path)
+
+    stats = {
+        "evidenceRoots": [str(p) for p in evidence_roots],
+        "sessionIndexFiles": len([p for p in index_files if p.exists()]),
+        "stateDbFiles": len([p for p in db_files if p.exists()]),
+        "threadCandidateFiles": len(candidate_files),
+        "forkResultFiles": len(mapping_files),
+        "titleEvidenceThreadIds": len(by_id),
+        "forkSourceLinks": len(source_for_fork),
+    }
+    return by_id, source_for_fork, stats
+
+
+def load_current_threads(codex_home: Path) -> dict[str, dict[str, Any]]:
+    with connect_db(codex_home, readonly=True) as conn:
+        cols = table_columns(conn, "threads")
+        wanted = [
+            "id",
+            "title",
+            "first_user_message",
+            "model_provider",
+            "model",
+            "rollout_path",
+            "archived",
+            "updated_at",
+            "updated_at_ms",
+        ]
+        parts = []
+        for name in wanted:
+            if name in cols:
+                parts.append(f"coalesce({name}, '') as {name}" if name != "archived" else name)
+            else:
+                parts.append(f"'' as {name}")
+        return {row["id"]: dict(row) for row in conn.execute(f"select {', '.join(parts)} from threads")}
+
+
+def infer_source_links_from_rollouts(
+    codex_home: Path,
+    current_threads: dict[str, dict[str, Any]],
+    source_for_fork: dict[str, list[dict[str, str]]],
+    target_providers: set[str] | None,
+) -> int:
+    inferred = 0
+    for thread_id, row in current_threads.items():
+        if thread_id in source_for_fork:
+            continue
+        if target_providers and str(row.get("model_provider") or "") not in target_providers:
+            continue
+        rollout_path = normalize_rollout_path(str(row.get("rollout_path") or ""))
+        if not rollout_path:
+            continue
+        path = rollout_path if rollout_path.is_absolute() else codex_home / rollout_path
+        if not path.exists():
+            continue
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        hits = {match.lower() for match in UUID_RE.findall(text)}
+        hits.discard(thread_id.lower())
+        old_ids = [
+            candidate
+            for candidate in hits
+            if candidate in current_threads
+            and str(current_threads[candidate].get("model_provider") or "") != str(row.get("model_provider") or "")
+        ]
+        if len(old_ids) == 1:
+            source_for_fork.setdefault(thread_id, []).append({
+                "sourceThreadId": old_ids[0],
+                "path": str(path),
+                "kind": "rollout_uuid_unique",
+            })
+            inferred += 1
+    return inferred
+
+
+TITLE_KIND_PRIORITY = {
+    "fork_results_direct": 0,
+    "source_session_index": 1,
+    "source_thread_candidates": 2,
+    "source_fork_results_source": 3,
+    "source_state_db": 4,
+    "session_index": 5,
+    "thread_candidates": 6,
+    "fork_results_source": 7,
+    "state_db": 8,
+    "current_state_db": 9,
+}
+TITLE_CONFIDENCE_KINDS = {
+    "strong": {
+        "fork_results_direct",
+        "session_index",
+        "thread_candidates",
+        "source_session_index",
+        "source_thread_candidates",
+        "source_fork_results_source",
+    },
+    "medium": {
+        "fork_results_direct",
+        "session_index",
+        "thread_candidates",
+        "source_session_index",
+        "source_thread_candidates",
+        "source_fork_results_source",
+        "source_state_db",
+        "state_db",
+    },
+    "all": set(TITLE_KIND_PRIORITY),
+}
+
+
+def choose_title_evidence(values: list[dict[str, Any]], max_title_length: int) -> dict[str, Any] | None:
+    candidates = []
+    for item in values:
+        title = normalize_title(item.get("title"), max_title_length)
+        if not title:
+            continue
+        copied = dict(item)
+        copied["title"] = title
+        candidates.append(copied)
+    if not candidates:
+        return None
+    candidates.sort(
+        key=lambda item: (
+            TITLE_KIND_PRIORITY.get(str(item.get("kind") or ""), 99),
+            len(str(item.get("title") or "")) > 140,
+            str(item.get("title") or ""),
+        )
+    )
+    return candidates[0]
+
+
+def build_title_repair_plan(
+    codex_home: Path,
+    evidence_roots: list[Path],
+    mapping_paths: list[Path],
+    target_providers: set[str] | None,
+    max_title_length: int,
+    include_current_db_fallback: bool,
+    infer_from_rollout: bool,
+    only_missing_index: bool,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    current_threads = load_current_threads(codex_home)
+    current_index = {
+        str(item.get("id")): normalize_title(item.get("thread_name"), 0)
+        for item in read_session_index(codex_home / SESSION_INDEX)
+        if item.get("id")
+    }
+    evidence_by_id, source_for_fork, stats = load_title_evidence(
+        codex_home=codex_home,
+        evidence_roots=evidence_roots,
+        mapping_paths=mapping_paths,
+        include_current_db_fallback=include_current_db_fallback,
+    )
+    inferred = infer_source_links_from_rollouts(
+        codex_home,
+        current_threads,
+        source_for_fork,
+        target_providers,
+    ) if infer_from_rollout else 0
+
+    plan: list[dict[str, Any]] = []
+    for thread_id, row in current_threads.items():
+        provider = str(row.get("model_provider") or "")
+        if target_providers and provider not in target_providers:
+            continue
+        current_title = normalize_title(row.get("title"), 0)
+        current_index_title = current_index.get(thread_id, "")
+        if only_missing_index and current_index_title:
+            continue
+
+        candidates = [dict(item) for item in evidence_by_id.get(thread_id, [])]
+        for link in source_for_fork.get(thread_id, []):
+            source_id = link["sourceThreadId"]
+            for item in evidence_by_id.get(source_id, []):
+                copied = dict(item)
+                copied["kind"] = f"source_{copied.get('kind')}"
+                copied["sourceThreadId"] = source_id
+                copied["sourceEvidence"] = link.get("path")
+                copied["sourceEvidenceKind"] = link.get("kind")
+                candidates.append(copied)
+
+        chosen = choose_title_evidence(candidates, max_title_length)
+        if not chosen:
+            continue
+        desired = normalize_title(chosen["title"], max_title_length)
+        if not desired:
+            continue
+
+        update_index = current_index_title != desired
+        reliable_for_db = (
+            str(chosen.get("kind")) in {
+                "fork_results_direct",
+                "session_index",
+                "thread_candidates",
+                "source_session_index",
+                "source_thread_candidates",
+                "source_fork_results_source",
+                "source_state_db",
+            }
+            or bool(chosen.get("sourceThreadId"))
+        )
+        update_db = (
+            current_title != desired
+            and str(chosen.get("kind")) != "current_state_db"
+            and (
+                reliable_for_db
+                or is_placeholder_title(current_title)
+                or is_placeholder_title(current_index_title)
+                or not current_index_title
+            )
+        )
+        if not update_index and not update_db:
+            continue
+
+        plan.append({
+            "threadId": thread_id,
+            "modelProvider": provider,
+            "archived": bool(row.get("archived")),
+            "updatedAt": row.get("updated_at_ms") or row.get("updated_at"),
+            "currentTitle": current_title,
+            "currentIndexTitle": current_index_title,
+            "desiredTitle": desired,
+            "evidenceKind": chosen.get("kind"),
+            "evidencePath": chosen.get("path"),
+            "sourceThreadId": chosen.get("sourceThreadId"),
+            "sourceEvidence": chosen.get("sourceEvidence"),
+            "sourceEvidenceKind": chosen.get("sourceEvidenceKind"),
+            "updateStateDbTitle": update_db,
+            "updateSessionIndex": update_index,
+        })
+
+    stats.update({
+        "codexHome": str(codex_home),
+        "currentThreads": len(current_threads),
+        "currentSessionIndexEntries": len(current_index),
+        "currentThreadsMissingSessionIndex": sum(1 for tid in current_threads if tid not in current_index),
+        "inferredSourceLinksFromRollouts": inferred,
+    })
+    return plan, stats
+
+
+def backup_before_title_repair(codex_home: Path, backup_root: Path) -> Path:
+    backup_dir = make_timestamp_dir(backup_root, "codex-title-repair-before")
+    db_path = codex_home / STATE_DB
+    if db_path.exists():
+        sqlite_backup(db_path, backup_dir / STATE_DB)
+        for suffix in ("-wal", "-shm"):
+            sidecar = codex_home / f"{STATE_DB}{suffix}"
+            if sidecar.exists():
+                shutil.copy2(sidecar, backup_dir / sidecar.name)
+    index_path = codex_home / SESSION_INDEX
+    if index_path.exists():
+        shutil.copy2(index_path, backup_dir / SESSION_INDEX)
+    return backup_dir
+
+
+def apply_title_repair(codex_home: Path, plan: list[dict[str, Any]]) -> dict[str, Any]:
+    state_updates = [item for item in plan if item.get("updateStateDbTitle")]
+    index_updates = [item for item in plan if item.get("updateSessionIndex")]
+
+    if state_updates:
+        with connect_db(codex_home, readonly=False) as conn:
+            conn.execute("pragma busy_timeout=10000")
+            for item in state_updates:
+                conn.execute(
+                    "update threads set title = ? where id = ?",
+                    (item["desiredTitle"], item["threadId"]),
+                )
+            conn.commit()
+
+    if index_updates:
+        index_path = codex_home / SESSION_INDEX
+        entries = read_session_index(index_path)
+        desired_by_id = {item["threadId"]: item["desiredTitle"] for item in index_updates}
+        seen: set[str] = set()
+        updated_at_by_id = {
+            item["threadId"]: epoch_to_iso_z(item.get("updatedAt"))
+            for item in index_updates
+        }
+        rewritten: list[dict[str, Any]] = []
+        for item in entries:
+            thread_id = item.get("id")
+            if not thread_id:
+                rewritten.append(item)
+                continue
+            thread_id = str(thread_id)
+            if thread_id in seen:
+                continue
+            seen.add(thread_id)
+            if thread_id in desired_by_id:
+                item = dict(item)
+                item["thread_name"] = desired_by_id[thread_id]
+                item["updated_at"] = item.get("updated_at") or updated_at_by_id.get(thread_id) or iso_now_z()
+            rewritten.append(item)
+
+        for thread_id, title in desired_by_id.items():
+            if thread_id not in seen:
+                rewritten.append({
+                    "id": thread_id,
+                    "thread_name": title,
+                    "updated_at": updated_at_by_id.get(thread_id) or iso_now_z(),
+                })
+        write_session_index(index_path, rewritten)
+
+    return {
+        "stateDbTitleUpdates": len(state_updates),
+        "sessionIndexUpdates": len(index_updates),
+    }
 
 
 def cmd_validate(args: argparse.Namespace) -> int:
@@ -724,6 +1335,83 @@ def cmd_validate(args: argparse.Namespace) -> int:
         or fork_wrong_model
         or fork_wrong_archive
     ) else 2
+
+
+def cmd_repair_titles(args: argparse.Namespace) -> int:
+    codex_home = discover_codex_home(args.codex_home)
+    backup_root = expand_path(args.backup_root) or (codex_home / "backups")
+    backup_root.mkdir(parents=True, exist_ok=True)
+
+    evidence_roots = evidence_roots_from_args(args.evidence_root)
+    mapping_paths = [p for p in (expand_path(raw) for raw in args.mapping or []) if p and p.exists()]
+    source_providers = None
+    if args.target_providers:
+        source_providers = {part.strip() for part in args.target_providers.split(",") if part.strip()}
+
+    plan, stats = build_title_repair_plan(
+        codex_home=codex_home,
+        evidence_roots=evidence_roots,
+        mapping_paths=mapping_paths,
+        target_providers=source_providers,
+        max_title_length=args.max_title_length,
+        include_current_db_fallback=not args.no_current_db_fallback,
+        infer_from_rollout=not args.no_infer_source_from_rollout,
+        only_missing_index=args.only_missing_index,
+    )
+
+    raw_plan_count = len(plan)
+    allowed_kinds = TITLE_CONFIDENCE_KINDS[args.confidence]
+    plan = [item for item in plan if str(item.get("evidenceKind")) in allowed_kinds]
+
+    result: dict[str, Any] = {
+        "codexHome": str(codex_home),
+        "execute": args.execute,
+        "confidence": args.confidence,
+        **stats,
+        "rawPlannedUpdatesBeforeConfidenceFilter": raw_plan_count,
+        "plannedUpdates": len(plan),
+        "plannedSessionIndexUpdates": sum(1 for item in plan if item["updateSessionIndex"]),
+        "plannedStateDbTitleUpdates": sum(1 for item in plan if item["updateStateDbTitle"]),
+        "plannedByProvider": dict(sorted(Counter(str(item["modelProvider"]) for item in plan).items())),
+        "plannedByEvidenceKind": dict(sorted(Counter(str(item["evidenceKind"]) for item in plan).items())),
+        "sourceLinkedUpdates": sum(1 for item in plan if item.get("sourceThreadId")),
+    }
+
+    if args.show_titles:
+        result["planSample"] = plan[: args.sample_limit]
+    else:
+        result["planSample"] = [
+            {
+                "threadId": item["threadId"],
+                "modelProvider": item["modelProvider"],
+                "archived": item["archived"],
+                "currentTitleLength": len(item["currentTitle"]),
+                "currentIndexTitleLength": len(item["currentIndexTitle"]),
+                "desiredTitleLength": len(item["desiredTitle"]),
+                "evidenceKind": item["evidenceKind"],
+                "evidencePath": item["evidencePath"],
+                "sourceThreadId": item.get("sourceThreadId"),
+                "updateStateDbTitle": item["updateStateDbTitle"],
+                "updateSessionIndex": item["updateSessionIndex"],
+            }
+            for item in plan[: args.sample_limit]
+        ]
+
+    out = backup_root / f"title-repair-plan-{now_stamp()}.json"
+    json_dump(out, {**result, "plan": plan})
+    result["planPath"] = str(out)
+
+    if args.execute:
+        backup_dir = backup_before_title_repair(codex_home, backup_root)
+        apply_result = apply_title_repair(codex_home, plan)
+        result["backupDir"] = str(backup_dir)
+        result.update(apply_result)
+        json_dump(out, {**result, "plan": plan})
+    else:
+        eprint("Dry-run only. Re-run with --execute to update state_5.sqlite and session_index.jsonl.")
+
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    return 0
 
 
 def provider_counts(codex_home: Path) -> list[dict[str, Any]]:
@@ -1014,6 +1702,26 @@ def build_parser() -> argparse.ArgumentParser:
     validate.add_argument("--target-provider", help="Expected fork provider")
     validate.add_argument("--target-model", help="Expected fork model")
     validate.set_defaults(func=cmd_validate)
+
+    repair_titles = sub.add_parser("repair-titles", help="Repair persistent thread titles from mappings and backups")
+    repair_titles.add_argument("--codex-home", help="Codex home containing state_5.sqlite")
+    repair_titles.add_argument("--backup-root", help="Backup root for plans and pre-write backups")
+    repair_titles.add_argument(
+        "--evidence-root",
+        action="append",
+        help="Directory or file to search for fork-results.json, thread-candidates.json, session_index.jsonl, and state_5.sqlite",
+    )
+    repair_titles.add_argument("--mapping", action="append", help="Explicit fork-results.json path; may be repeated")
+    repair_titles.add_argument("--target-providers", help="Comma-separated providers to repair, for example OpenAI")
+    repair_titles.add_argument("--max-title-length", type=int, default=160, help="Maximum repaired title length")
+    repair_titles.add_argument("--confidence", choices=["strong", "medium", "all"], default="strong", help="Evidence threshold for repairing titles")
+    repair_titles.add_argument("--only-missing-index", action="store_true", help="Only add missing session_index.jsonl entries")
+    repair_titles.add_argument("--no-current-db-fallback", action="store_true", help="Do not use current DB title as a fallback for missing index entries")
+    repair_titles.add_argument("--no-infer-source-from-rollout", action="store_true", help="Do not infer source thread ids by scanning rollout UUIDs")
+    repair_titles.add_argument("--show-titles", action="store_true", help="Include title text in the plan sample")
+    repair_titles.add_argument("--sample-limit", type=int, default=20, help="Number of planned repairs to include in output sample")
+    repair_titles.add_argument("--execute", action="store_true", help="Actually update state_5.sqlite and session_index.jsonl; without this, dry-run only")
+    repair_titles.set_defaults(func=cmd_repair_titles)
 
     export = sub.add_parser("export-package", help="Create a portable migration zip from candidates")
     export.add_argument("--codex-home", help="Source Codex home containing rollout files")

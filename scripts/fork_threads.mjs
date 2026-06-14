@@ -29,6 +29,7 @@ Options:
   --set-title-from-source             Name each fork from its source title (default: true)
   --no-set-title-from-source          Leave fork title for Codex to infer lazily
   --max-title-length <n>              Max copied title length (default: 120)
+  --title-settle-ms <n>               Delay before the final title re-apply (default: 250)
 `);
 }
 
@@ -42,6 +43,7 @@ function parseArgs(argv) {
     experimental: true,
     setTitleFromSource: true,
     maxTitleLength: 120,
+    titleSettleMs: 250,
   };
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
@@ -111,6 +113,9 @@ function parseArgs(argv) {
         break;
       case "--max-title-length":
         args.maxTitleLength = Number.parseInt(next(), 10);
+        break;
+      case "--title-settle-ms":
+        args.titleSettleMs = Number.parseInt(next(), 10);
         break;
       default:
         throw new Error(`Unknown argument: ${arg}`);
@@ -249,6 +254,15 @@ class RpcClient {
     }
   }
 
+  async bestEffortSetTitle(threadId, name) {
+    try {
+      await this.call("thread/name/set", { threadId, name }, 60000);
+      return null;
+    } catch (err) {
+      return err.message || String(err);
+    }
+  }
+
   close() {
     if (this.ws) this.ws.close();
   }
@@ -315,15 +329,15 @@ async function forkOne(client, candidate, args) {
   if (!forkThreadId) throw new Error(`thread/fork returned no thread id: ${JSON.stringify(fork)}`);
   rec.forkThreadId = forkThreadId;
 
+  const desiredTitle = args.setTitleFromSource ? titleFromSource(candidate, args.maxTitleLength) : "";
   if (args.setTitleFromSource) {
-    const name = titleFromSource(candidate, args.maxTitleLength);
-    if (name) {
-      try {
-        await client.call("thread/name/set", { threadId: forkThreadId, name }, 60000);
+    if (desiredTitle) {
+      const error = await client.bestEffortSetTitle(forkThreadId, desiredTitle);
+      if (!error) {
         rec.titleSetFromSource = true;
-        rec.title = name;
-      } catch (err) {
-        rec.titleSetError = err.message || String(err);
+        rec.title = desiredTitle;
+      } else {
+        rec.titleSetError = error;
       }
     }
   }
@@ -339,6 +353,21 @@ async function forkOne(client, candidate, args) {
   }
   if (Object.keys(errors).length > 0) {
     throw new Error(JSON.stringify(errors));
+  }
+
+  // Some Codex builds refresh sidebar metadata during archive/unarchive and can
+  // overwrite an earlier thread/name/set with a lazy "New conversation" title.
+  // Re-apply the copied source title after the final archive state is settled.
+  if (desiredTitle) {
+    const delay = Number.isFinite(args.titleSettleMs) && args.titleSettleMs > 0 ? args.titleSettleMs : 0;
+    if (delay) await new Promise((resolve) => setTimeout(resolve, delay));
+    const finalTitleError = await client.bestEffortSetTitle(forkThreadId, desiredTitle);
+    if (!finalTitleError) {
+      rec.titleSetAfterArchive = true;
+      rec.title = desiredTitle;
+    } else {
+      rec.titleSetAfterArchiveError = finalTitleError;
+    }
   }
 
   rec.status = "ok";
